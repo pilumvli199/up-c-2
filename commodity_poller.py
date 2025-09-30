@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-Commodity poller (Upstox -> Telegram)
-Tracks LTP for configured instruments (e.g. GOLD).
+Commodity poller (Upstox -> Telegram) - more robust LTP extraction + debug logging.
+Tracks configured instrument keys (FO/MCX) and posts LTP to Telegram every POLL_INTERVAL.
 """
-
-import os, time, logging, requests, html
+import os, time, logging, requests, html, json
 from urllib.parse import quote_plus
 
 logging.basicConfig(level=logging.INFO,
@@ -14,19 +13,10 @@ UPSTOX_ACCESS_TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# ====== UPDATE HERE: default instrument keys (you can override via EXPLICIT_INSTRUMENT_KEYS env) ======
-DEFAULT_EXPLICIT_KEYS = ",".join([
-    "MCX_FO|463267",   # GOLDTEN FUT 30 SEP 25
-    "MCX_FO|458302",   # GOLDGUINEA FUT 30 SEP 25
-    "MCX_FO|458303",   # GOLDPETAL FUT 30 SEP 25
-    "MCX_FO|440939",   # GOLD FUT 03 OCT 25
-    "MCX_FO|463393",   # GOLDM FUT 03 OCT 25
-    "MCX_FO|463265",   # GOLDGUINEA FUT 31 OCT 25
-    "MCX_FO|463266",   # GOLDPETAL FUT 31 OCT 25
-    "MCX_FO|466028",   # GOLDTEN FUT 31 OCT 25
+DEFAULT_EXPLICIT_KEYS = os.getenv("DEFAULT_EXPLICIT_KEYS") or ",".join([
+    "MCX_FO|463267","MCX_FO|458302","MCX_FO|458303",
+    "MCX_FO|440939","MCX_FO|463393","MCX_FO|463265","MCX_FO|463266","MCX_FO|466028",
 ])
-
-# Use env var if provided, otherwise fall back to DEFAULT_EXPLICIT_KEYS
 EXPLICIT_INSTRUMENT_KEYS = os.getenv("EXPLICIT_INSTRUMENT_KEYS", DEFAULT_EXPLICIT_KEYS)
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL") or 60)
 
@@ -34,21 +24,58 @@ if not UPSTOX_ACCESS_TOKEN or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
     logging.error("Missing env vars (UPSTOX_ACCESS_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)")
     raise SystemExit(1)
 
-HEADERS = {"Accept": "application/json", "Authorization": f"Bearer {UPSTOX_ACCESS_TOKEN}"}
+HEADERS = {"Accept":"application/json","Authorization":f"Bearer {UPSTOX_ACCESS_TOKEN}"}
 LTP_URL = "https://api.upstox.com/v3/market-quote/ltp"
 
-def send_telegram(text: str):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}
+# --- helpers to extract LTP robustly ---
+def find_ltp_in_obj(obj):
+    """
+    Try many possible field names and nested locations to find a numeric LTP.
+    Returns float or None.
+    """
+    if obj is None:
+        return None
+    # direct numeric
+    if isinstance(obj, (int, float)):
+        return float(obj)
+    # dict: check common keys first
+    if isinstance(obj, dict):
+        # common direct keys
+        for k in ('ltp','last_traded_price','lastPrice','lastTradedPrice','last','last_price','lt'):
+            if k in obj and obj[k] not in (None,""):
+                try:
+                    return float(obj[k])
+                except Exception:
+                    pass
+        # nested: check standard containers
+        for k in obj:
+            try:
+                val = find_ltp_in_obj(obj[k])
+                if val is not None:
+                    return val
+            except Exception:
+                continue
+        return None
+    # list: search elements
+    if isinstance(obj, list):
+        for el in obj:
+            val = find_ltp_in_obj(el)
+            if val is not None:
+                return val
+    # fallback: try parse numeric-like string
     try:
-        r = requests.post(url, json=payload, timeout=10)
-        r.raise_for_status()
-        return True
-    except Exception as e:
-        logging.warning("Telegram send failed: %s", e)
-        return False
+        s = str(obj).strip()
+        if s.replace('.','',1).replace('-','',1).isdigit():
+            return float(s)
+    except Exception:
+        pass
+    return None
 
-def get_ltps(keys):
+def get_ltps_for_keys(keys):
+    """
+    Query Upstox LTP endpoint for a list of instrument keys.
+    Returns raw JSON or None, and logs HTTP error body for debug.
+    """
     if not keys:
         return None
     q = ",".join(keys)
@@ -60,74 +87,113 @@ def get_ltps(keys):
     except requests.exceptions.HTTPError as he:
         body = he.response.text if he.response is not None else ""
         status = getattr(he.response, "status_code", "??")
-        logging.error("Upstox LTP HTTPError %s: %s", status, body[:1000])
+        logging.error("Upstox LTP HTTPError %s: %.800s", status, body)
         return None
     except Exception as e:
         logging.exception("Upstox LTP fetch failed: %s", e)
         return None
 
-def parse_resp(resp):
+def parse_upstox_resp(resp):
+    """
+    Return list of tuples: (instrument_key, trading_symbol/display, ltp_or_none, raw_payload)
+    Works with responses shaped as {data: {ik: {...}}} or list-of-items.
+    """
     out = []
     if not resp:
         return out
-    # handle multiple shapes
+    # pattern: resp['data'] often holds mapping or list
+    data = None
     if isinstance(resp, dict) and 'data' in resp:
         data = resp['data']
-        # data may be dict or list
-        if isinstance(data, dict):
-            # mapping instrument_key -> payload
-            for ik, payload in data.items():
-                ltp = None
-                if isinstance(payload, dict):
-                    for key in ('ltp', 'lastPrice', 'last_traded_price'):
-                        if key in payload and payload[key] is not None:
-                            ltp = payload[key]; break
-                    sym = payload.get('trading_symbol') or payload.get('symbol') or ik
-                else:
-                    sym = ik
-                out.append((ik, sym, ltp))
-        elif isinstance(data, list):
-            for item in data:
-                ik = item.get('instrument_key') or item.get('instrumentKey') or item.get('symbol') or None
-                sym = item.get('trading_symbol') or item.get('symbol') or ik
-                ltp = item.get('ltp') or item.get('lastPrice') or item.get('last_traded_price')
-                out.append((ik, sym, ltp))
-    elif isinstance(resp, dict):
-        # fallback: try parse mapping
-        for ik, payload in resp.items():
+    else:
+        data = resp
+
+    # if data is a dict mapping instrument_key -> payload
+    if isinstance(data, dict):
+        for ik, payload in data.items():
+            sym = None
+            raw = payload
             if isinstance(payload, dict):
-                ltp = payload.get('ltp') or payload.get('lastPrice') or payload.get('last_traded_price')
                 sym = payload.get('trading_symbol') or payload.get('symbol') or ik
-                out.append((ik, sym, ltp))
-    elif isinstance(resp, list):
-        for item in resp:
-            ik = item.get('instrument_key') or item.get('symbol') or None
+                ltp = find_ltp_in_obj(payload)
+            else:
+                sym = ik
+                ltp = find_ltp_in_obj(payload)
+            out.append((ik, sym, ltp, raw))
+        return out
+
+    # if data is a list of items
+    if isinstance(data, list):
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            ik = item.get('instrument_key') or item.get('instrumentKey') or item.get('symbol') or None
             sym = item.get('trading_symbol') or item.get('symbol') or ik
-            ltp = item.get('ltp') or item.get('lastPrice') or item.get('last_traded_price')
-            out.append((ik, sym, ltp))
+            ltp = find_ltp_in_obj(item)
+            out.append((ik, sym, ltp, item))
+        return out
+
+    # fallback: try to parse top-level
+    try:
+        ltp = find_ltp_in_obj(resp)
+        out.append((None, None, ltp, resp))
+    except Exception:
+        pass
     return out
 
+def send_telegram(text):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id":TELEGRAM_CHAT_ID,"text":text,"parse_mode":"HTML","disable_web_page_preview":True}
+    try:
+        r = requests.post(url, json=payload, timeout=12)
+        r.raise_for_status()
+        return True
+    except Exception as e:
+        logging.warning("Telegram send failed: %s", e)
+        return False
+
+# --- main loop ---
 def main():
-    # prepare keys list
     keys = [k.strip() for k in EXPLICIT_INSTRUMENT_KEYS.split(",") if k.strip()]
+    if not keys:
+        logging.error("No instrument keys configured; set EXPLICIT_INSTRUMENT_KEYS env or DEFAULT_EXPLICIT_KEYS")
+        return
     logging.info("Starting poller for %d keys", len(keys))
     logging.info("Instrument keys: %s", ", ".join(keys))
-    if not keys:
-        logging.error("No instrument keys configured")
-        return
+
     while True:
         try:
-            resp = get_ltps(keys)
-            parsed = parse_resp(resp)
-            if parsed:
-                ts = time.strftime("%Y-%m-%d %H:%M:%S")
-                msg = "\n".join([f"{sym}: {ltp}" for _, sym, ltp in parsed])
-                send_telegram(f"📈 Upstox LTP Update — {ts}\n{msg}")
-                logging.info("Sent update for %d items", len(parsed))
+            raw = get_ltps_for_keys(keys)
+            parsed = parse_upstox_resp(raw)
+            # build message lines
+            lines = []
+            any_present = False
+            for ik, sym, ltp, raw_payload in parsed:
+                display = sym or ik or "UNKNOWN"
+                if ltp is None:
+                    lines.append(f"{display}: NA")
+                else:
+                    lines.append(f"{display}: {float(ltp):,.2f}")
+                    any_present = True
+            ts = time.strftime("%Y-%m-%d %H:%M:%S")
+            header = f"📈 Upstox LTP Update — {ts}"
+            text = header + "\n" + "\n".join(lines)
+            # if everything NA, attach a tiny debug snippet of raw JSON (short) and log it
+            if not any_present:
+                # small safe snippet
+                try:
+                    raw_snip = json.dumps(raw, default=str)[:1500]
+                except Exception:
+                    raw_snip = str(raw)[:1000]
+                debug_text = header + "\nAll LTPs None — raw response snippet:\n" + html.escape(raw_snip)
+                logging.warning("All LTPs None this cycle. Raw response snippet: %s", raw_snip[:400])
+                # send debug to telegram so you can see the API output too
+                send_telegram(debug_text)
             else:
-                logging.info("No LTP data received for this cycle.")
+                send_telegram(text)
+                logging.info("Sent update: %s", text.splitlines()[1] if len(text.splitlines())>1 else header)
         except Exception as e:
-            logging.exception("Error in main loop: %s", e)
+            logging.exception("Unhandled error in main loop: %s", e)
         time.sleep(POLL_INTERVAL)
 
 if __name__ == "__main__":
